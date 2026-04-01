@@ -2,3 +2,4 @@
 build/
 .xmake/
 compile_commands.json
+node_modules/
