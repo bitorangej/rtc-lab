@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC 最小可观测实验台</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 24px;
+        line-height: 1.5;
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 16px;
+      }
+      video {
+        width: 360px;
+        background: #111;
+        border-radius: 8px;
+      }
+      textarea {
+        width: 100%;
+        height: 220px;
+        margin-top: 12px;
+        font-family: ui-monospace, monospace;
+      }
+      button,
+      input,
+      select {
+        padding: 8px 12px;
+      }
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      pre {
+        background: #f6f8fa;
+        padding: 12px;
+        border-radius: 8px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🧪 WebRTC 最小可观测实验台</h1>
+
+    <div class="card">
+      <div class="row">
+        <input id="roomId" value="lab-1" placeholder="房间号" />
+        <select id="icePreset">
+          <option value="none">无 ICE Server（先看 host）</option>
+          <option value="stun">STUN（观察 srflx）</option>
+          <option value="relay">强制 relay（需要你自己的 TURN）</option>
+        </select>
+        <input
+          id="turnUrl"
+          placeholder="turn:your-turn-server:3478?transport=udp"
+          style="min-width: 320px"
+        />
+        <input id="turnUser" placeholder="TURN username" />
+        <input id="turnPass" placeholder="TURN password" />
+      </div>
+
+      <div class="row">
+        <button id="joinBtn">加入房间</button>
+        <button id="startStatsBtn">开始采样</button>
+        <button id="stopStatsBtn">停止采样</button>
+        <button id="downloadCsvBtn">下载 CSV</button>
+        <button id="downloadJsonBtn">下载 JSON</button>
+      </div>
+
+      <pre id="status"></pre>
+    </div>
+
+    <div class="row">
+      <div>
+        <div>本地视频</div>
+        <video id="localVideo" autoplay playsinline muted></video>
+      </div>
+      <div>
+        <div>远端视频</div>
+        <video id="remoteVideo" autoplay playsinline></video>
+      </div>
+    </div>
+
+    <div class="card">
+      <div>事件日志</div>
+      <textarea id="log" readonly></textarea>
+    </div>
+
+    <script>
+      const localVideo = document.getElementById("localVideo");
+      const remoteVideo = document.getElementById("remoteVideo");
+      const roomIdInput = document.getElementById("roomId");
+      const icePreset = document.getElementById("icePreset");
+      const turnUrl = document.getElementById("turnUrl");
+      const turnUser = document.getElementById("turnUser");
+      const turnPass = document.getElementById("turnPass");
+      const statusEl = document.getElementById("status");
+      const logEl = document.getElementById("log");
+
+      let ws = null;
+      let pc = null;
+      let localStream = null;
+      let isInitiator = false;
+
+      let statsTimer = null;
+      let prevReport = null;
+      let statsRows = [];
+      let rawSnapshots = [];
+
+      function log(...args) {
+        const line = `[${new Date().toLocaleTimeString()}] ${args.join(" ")}`;
+        logEl.value += line + "\\n";
+        logEl.scrollTop = logEl.scrollHeight;
+        console.log(line);
+      }
+
+      function setStatus() {
+        statusEl.textContent = JSON.stringify({
+          signalingState: pc?.signalingState,
+          connectionState: pc?.connectionState,
+          iceConnectionState: pc?.iceConnectionState,
+          iceGatheringState: pc?.iceGatheringState,
+          localTracks: localStream ? localStream.getTracks().map(t => ({
+            kind: t.kind,
+            enabled: t.enabled,
+            readyState: t.readyState
+          })) : []
+        }, null, 2);
+      }
+
+      function buildIceConfig() {
+        const preset = icePreset.value;
+
+        if (preset === "none") {
+          return { iceServers: [] };
+        }
+
+        if (preset === "stun") {
+          // 第一版实验建议你先填自己的 STUN；很多人也会临时用公共 STUN。
+          return {
+            iceServers: [
+              { urls: ["stun:stun.l.google.com:19302"] }
+            ]
+          };
+        }
+
+        if (preset === "relay") {
+          return {
+            iceTransportPolicy: "relay",
+            iceServers: [
+              {
+                urls: [turnUrl.value.trim()],
+                username: turnUser.value.trim(),
+                credential: turnPass.value.trim()
+              }
+            ]
+          };
+        }
+
+        return { iceServers: [] };
+      }
+
+      async function ensureMedia() {
+        if (localStream) return localStream;
+
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 360 },
+            frameRate: { ideal: 15, max: 15 }
+          }
+        });
+
+        localVideo.srcObject = localStream;
+        log("getUserMedia 成功");
+        setStatus();
+        return localStream;
+      }
+
+      async function ensurePeerConnection() {
+        if (pc) return pc;
+
+        pc = new RTCPeerConnection(buildIceConfig());
+
+        pc.addEventListener("icecandidate", (event) => {
+          if (event.candidate !== null) {
+            ws.send(JSON.stringify({
+              type: "signal",
+              data: { candidate: event.candidate }
+            }));
+            log("发送 candidate:", event.candidate.candidate || "<end-of-candidates>");
+          }
+        });
+
+        pc.addEventListener("icecandidateerror", (event) => {
+          log("icecandidateerror:", event.url || "", "code=", event.errorCode, event.errorText || "");
+        });
+
+        pc.addEventListener("iceconnectionstatechange", () => {
+          log("iceConnectionState =", pc.iceConnectionState);
+          setStatus();
+        });
+
+        pc.addEventListener("icegatheringstatechange", () => {
+          log("iceGatheringState =", pc.iceGatheringState);
+          setStatus();
+        });
+
+        pc.addEventListener("connectionstatechange", () => {
+          log("connectionState =", pc.connectionState);
+          setStatus();
+        });
+
+        pc.addEventListener("signalingstatechange", () => {
+          log("signalingState =", pc.signalingState);
+          setStatus();
+        });
+
+        pc.addEventListener("track", (event) => {
+          if (!remoteVideo.srcObject) {
+            remoteVideo.srcObject = event.streams[0];
+          }
+          log("收到远端 track:", event.track.kind, event.track.id);
+        });
+
+        const stream = await ensureMedia();
+        for (const track of stream.getTracks()) {
+          pc.addTrack(track, stream);
+        }
+
+        setStatus();
+        return pc;
+      }
+
+      async function makeOffer() {
+        await ensurePeerConnection();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        ws.send(JSON.stringify({
+          type: "signal",
+          data: { description: pc.localDescription }
+        }));
+
+        log("发送 offer");
+      }
+
+      async function handleSignal(data) {
+        await ensurePeerConnection();
+
+        if (data.description) {
+          const desc = data.description;
+          await pc.setRemoteDescription(desc);
+          log("收到", desc.type);
+
+          if (desc.type === "offer") {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            ws.send(JSON.stringify({
+              type: "signal",
+              data: { description: pc.localDescription }
+            }));
+
+            log("发送 answer");
+          }
+          return;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(data, "candidate")) {
+          try {
+            await pc.addIceCandidate(data.candidate);
+            log("添加远端 candidate");
+          } catch (err) {
+            log("addIceCandidate 失败:", err.message);
+          }
+        }
+      }
+
+      function pickStats(report, type, kind) {
+        for (const stat of report.values()) {
+          if (stat.type === type && (!kind || stat.kind === kind)) {
+            return stat;
+          }
+        }
+        return null;
+      }
+
+      function calcRate(curr, prev, field) {
+        if (!curr || !prev) return null;
+        if (curr[field] == null || prev[field] == null) return null;
+
+        const dt = (curr.timestamp - prev.timestamp) / 1000;
+        if (dt <= 0) return null;
+
+        return ((curr[field] - prev[field]) * 8) / dt;
+      }
+
+      function calcDelta(curr, prev, field) {
+        if (!curr || !prev) return null;
+        if (curr[field] == null || prev[field] == null) return null;
+        return curr[field] - prev[field];
+      }
+
+      function findSelectedPair(report) {
+        let transport = null;
+        for (const stat of report.values()) {
+          if (stat.type === "transport" && stat.selectedCandidatePairId) {
+            transport = stat;
+            break;
+          }
+        }
+
+        let pair = null;
+        if (transport?.selectedCandidatePairId) {
+          pair = report.get(transport.selectedCandidatePairId) || null;
+        }
+
+        // 兼容性兜底：某些浏览器可能拿不到 selectedCandidatePairId。
+        if (!pair) {
+          for (const stat of report.values()) {
+            if (stat.type === "candidate-pair" && (stat.selected === true || (stat.nominated && stat.state === "succeeded"))) {
+              pair = stat;
+              break;
+            }
+          }
+        }
+
+        if (!pair) return { transport: null, pair: null, local: null, remote: null };
+
+        return {
+          transport,
+          pair,
+          local: report.get(pair.localCandidateId) || null,
+          remote: report.get(pair.remoteCandidateId) || null
+        };
+      }
+
+      async function collectStatsOnce() {
+        if (!pc) return;
+
+        const report = await pc.getStats();
+        const now = new Date().toISOString();
+
+        const outboundAudio = pickStats(report, "outbound-rtp", "audio");
+        const outboundVideo = pickStats(report, "outbound-rtp", "video");
+        const inboundAudio = pickStats(report, "inbound-rtp", "audio");
+        const inboundVideo = pickStats(report, "inbound-rtp", "video");
+        const remoteInboundAudio = pickStats(report, "remote-inbound-rtp", "audio");
+        const remoteInboundVideo = pickStats(report, "remote-inbound-rtp", "video");
+
+        const prevOutboundAudio = outboundAudio && prevReport ? prevReport.get(outboundAudio.id) : null;
+        const prevOutboundVideo = outboundVideo && prevReport ? prevReport.get(outboundVideo.id) : null;
+        const prevInboundAudio = inboundAudio && prevReport ? prevReport.get(inboundAudio.id) : null;
+        const prevInboundVideo = inboundVideo && prevReport ? prevReport.get(inboundVideo.id) : null;
+
+        const selected = findSelectedPair(report);
+        const prevPair = selected.pair && prevReport ? prevReport.get(selected.pair.id) : null;
+
+        const row = {
+          ts: now,
+
+          signalingState: pc.signalingState,
+          connectionState: pc.connectionState,
+          iceConnectionState: pc.iceConnectionState,
+          iceGatheringState: pc.iceGatheringState,
+
+          localCandidateType: selected.local?.candidateType ?? "",
+          localCandidateProtocol: selected.local?.protocol ?? "",
+          localCandidateAddress: selected.local?.address ?? "",
+          localCandidatePort: selected.local?.port ?? "",
+          remoteCandidateType: selected.remote?.candidateType ?? "",
+          remoteCandidateProtocol: selected.remote?.protocol ?? "",
+          remoteCandidateAddress: selected.remote?.address ?? "",
+          remoteCandidatePort: selected.remote?.port ?? "",
+
+          pairState: selected.pair?.state ?? "",
+          pairCurrentRttMs: selected.pair?.currentRoundTripTime != null
+            ? (selected.pair.currentRoundTripTime * 1000).toFixed(2)
+            : "",
+          pairSendBitratebps: selected.pair ? Math.round(calcRate(selected.pair, prevPair, "bytesSent") ?? 0) : "",
+          pairRecvBitratebps: selected.pair ? Math.round(calcRate(selected.pair, prevPair, "bytesReceived") ?? 0) : "",
+
+          audioSendBitratebps: Math.round(calcRate(outboundAudio, prevOutboundAudio, "bytesSent") ?? 0),
+          videoSendBitratebps: Math.round(calcRate(outboundVideo, prevOutboundVideo, "bytesSent") ?? 0),
+          audioRecvBitratebps: Math.round(calcRate(inboundAudio, prevInboundAudio, "bytesReceived") ?? 0),
+          videoRecvBitratebps: Math.round(calcRate(inboundVideo, prevInboundVideo, "bytesReceived") ?? 0),
+
+          audioPacketsLost: inboundAudio?.packetsLost ?? "",
+          videoPacketsLost: inboundVideo?.packetsLost ?? "",
+          audioJitterMs: inboundAudio?.jitter != null ? (inboundAudio.jitter * 1000).toFixed(2) : "",
+          videoJitterMs: inboundVideo?.jitter != null ? (inboundVideo.jitter * 1000).toFixed(2) : "",
+
+          remoteAudioRttMs: remoteInboundAudio?.roundTripTime != null
+            ? (remoteInboundAudio.roundTripTime * 1000).toFixed(2)
+            : "",
+          remoteVideoRttMs: remoteInboundVideo?.roundTripTime != null
+            ? (remoteInboundVideo.roundTripTime * 1000).toFixed(2)
+            : "",
+
+          videoSendFps: outboundVideo?.framesPerSecond ??
+            Math.round(calcDelta(outboundVideo, prevOutboundVideo, "framesSent") ?? 0),
+
+          videoRecvFps: inboundVideo?.framesPerSecond ??
+            Math.round(calcDelta(inboundVideo, prevInboundVideo, "framesDecoded") ?? 0),
+
+          videoFramesDecoded: inboundVideo?.framesDecoded ?? "",
+          videoFrameWidth: inboundVideo?.frameWidth ?? "",
+          videoFrameHeight: inboundVideo?.frameHeight ?? "",
+
+          remoteVideoPaused: remoteVideo.paused,
+          remoteVideoEnded: remoteVideo.ended,
+          remoteVideoReadyState: remoteVideo.readyState,
+          remoteVideoCurrentTime: remoteVideo.currentTime.toFixed(3)
+        };
+
+        statsRows.push(row);
+
+        const rawObject = {};
+        report.forEach((value, key) => {
+          rawObject[key] = value;
+        });
+        rawSnapshots.push({
+          ts: now,
+          report: rawObject
+        });
+
+        prevReport = report;
+        setStatus();
+      }
+
+      function startStats() {
+        if (statsTimer) return;
+        statsTimer = setInterval(() => {
+          collectStatsOnce().catch((err) => log("collectStats 失败:", err.message));
+        }, 1000);
+        log("开始每秒采样 getStats()");
+      }
+
+      function stopStats() {
+        if (!statsTimer) return;
+        clearInterval(statsTimer);
+        statsTimer = null;
+        log("停止采样");
+      }
+
+      function downloadText(filename, text, mimeType) {
+        const blob = new Blob([text], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      function toCsv(rows) {
+        if (rows.length === 0) return "";
+        const headers = Object.keys(rows[0]);
+
+        const escape = (value) => {
+          const s = String(value ?? "");
+          if (s.includes(",") || s.includes("\\n") || s.includes("\\"")) {
+            return "\\"" + s.replaceAll("\\"", "\\"\\"") + "\\"";
+          }
+          return s;
+        };
+
+        const lines = [headers.join(",")];
+        for (const row of rows) {
+          lines.push(headers.map((h) => escape(row[h])).join(","));
+        }
+        return lines.join("\\n");
+      }
+
+      document.getElementById("joinBtn").addEventListener("click", async () => {
+        await ensureMedia();
+
+        ws?.close();
+        ws = new WebSocket(`ws://${location.host}`);
+
+        ws.addEventListener("open", async () => {
+          log("WebSocket 已连接");
+          await ensurePeerConnection();
+          ws.send(JSON.stringify({
+            type: "join",
+            roomId: roomIdInput.value.trim()
+          }));
+        });
+
+        ws.addEventListener("message", async (event) => {
+          const msg = JSON.parse(event.data);
+
+          if (msg.type === "joined") {
+            isInitiator = msg.isInitiator;
+            log("加入房间成功:", msg.roomId, "isInitiator=", String(isInitiator));
+            return;
+          }
+
+          if (msg.type === "ready") {
+            log("房间已就绪，开始协商");
+            if (isInitiator) {
+              await makeOffer();
+            }
+            return;
+          }
+
+          if (msg.type === "signal") {
+            await handleSignal(msg.data);
+            return;
+          }
+
+          if (msg.type === "peer-left") {
+            log("对端已离开");
+            return;
+          }
+
+          if (msg.type === "full") {
+            log("房间已满");
+          }
+        });
+
+        ws.addEventListener("close", () => log("WebSocket 已关闭"));
+        ws.addEventListener("error", () => log("WebSocket 发生错误"));
+      });
+
+      document.getElementById("startStatsBtn").addEventListener("click", startStats);
+      document.getElementById("stopStatsBtn").addEventListener("click", stopStats);
+
+      document.getElementById("downloadCsvBtn").addEventListener("click", () => {
+        downloadText("stats-summary.csv", toCsv(statsRows), "text/csv;charset=utf-8");
+      });
+
+      document.getElementById("downloadJsonBtn").addEventListener("click", () => {
+        downloadText("stats-raw.json", JSON.stringify(rawSnapshots, null, 2), "application/json");
+      });
+
+      setStatus();
+    </script>
+  </body>
+</html>
